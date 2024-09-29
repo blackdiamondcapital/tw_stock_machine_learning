@@ -1,0 +1,268 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+
+# 1. 创建滞后特征的函数（延长时间窗口）
+def create_lagged_features(df, lag_days=20):
+    lagged_data = pd.DataFrame()
+
+    # 创建滞后特征，使用 20 天滞后特征
+    for i in range(1, lag_days + 1):
+        lagged_data[f'lag_{i}'] = df['close_price'].shift(i)
+    
+    # 目标值是未来一天的收盘价
+    lagged_data['target'] = df['close_price'].shift(-1)
+
+    # 移除空值
+    lagged_data.dropna(inplace=True)
+    
+    return lagged_data
+
+# 2. 准备数据
+def prepare_ml_data_for_forecast(df_price, lag_days=20):
+    # 检查是否存在 'date' 列
+    if 'date' not in df_price.columns:
+        print("没有找到 'date' 列，检查日期列并修改代码")
+        print("现有的列为：", df_price.columns)
+    else:
+        df_price['date'] = pd.to_datetime(df_price['date'])
+        df_price.set_index('date', inplace=True)
+
+    # 创建滞后特征
+    lagged_data = create_lagged_features(df_price, lag_days=lag_days)
+    
+    # 设置特征和目标变量
+    features = [f'lag_{i}' for i in range(1, lag_days + 1)]
+    X = lagged_data[features]
+    y = lagged_data['target']
+    
+    return X, y
+
+# 3. 构建随机森林模型并进行训练和预测
+def train_random_forest_for_forecast(X, y):
+    # 分割数据集为训练集和测试集
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # 构建随机森林回归模型
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+
+    # 预测
+    y_pred = rf.predict(X_test)
+
+    # 计算评估指标
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    # 计算 MAPE
+    def mean_absolute_percentage_error(y_true, y_pred): 
+        return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    
+    mape = mean_absolute_percentage_error(y_test, y_pred)
+
+    # 计算 SMAPE
+    def smape(y_true, y_pred):
+        return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
+
+    smape_value = smape(y_test, y_pred)
+
+    # 创建评估结果的字典
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R²': r2,
+        'MAPE (%)': mape,
+        'SMAPE (%)': smape_value
+    }
+
+    return rf, scaler, metrics, y_test, y_pred
+
+# 4. 基于模型预测进行交易策略回测，并记录买卖点，设置交易阈值
+def backtest_strategy(y_test, y_pred, initial_cash=10000, trade_size=100, threshold=0.01):
+    """
+    根据模型的预测结果进行交易策略回测，并记录买卖点
+    :param y_test: 实际价格数组
+    :param y_pred: 模型预测价格数组
+    :param initial_cash: 初始资金
+    :param trade_size: 每次交易的股票数量
+    :param threshold: 价格变化的阈值，只有变化超过阈值时才进行交易 (默认 1%)
+    :return: 回测结果 DataFrame 和回测指标
+    """
+    capital = initial_cash
+    position = 0
+    capital_curve = []
+    cash_history = []
+    positions_history = []
+    buy_signals = []
+    sell_signals = []
+
+    # 转换为 numpy 数组
+    y_test = np.array(y_test)
+    y_pred = np.array(y_pred)
+    
+    # 遍历测试集，生成交易信号并模拟交易
+    for i in range(len(y_test)):
+        actual_price = y_test[i]
+        predicted_price = y_pred[i]
+        
+        # 计算价格变化百分比
+        price_change = (predicted_price - actual_price) / actual_price
+
+        # 打印决策过程
+        print(f"Day {i}: Actual Price = {actual_price:.2f}, Predicted Price = {predicted_price:.2f}, Price Change = {price_change:.4f}")
+
+        # 根据价格变化和阈值生成交易信号，只有当价格变化超过阈值时才进行交易
+        if price_change > threshold:
+            # 预测价格上涨超过阈值，买入
+            if capital >= trade_size * actual_price:
+                capital -= trade_size * actual_price
+                position += trade_size
+                buy_signals.append(i)  # 记录买入的索引
+                print(f"  Buy {trade_size} shares at price {actual_price:.2f}. New capital = {capital:.2f}, Position = {position} shares.")
+        elif price_change < -threshold:
+            # 预测价格下跌超过阈值，卖出
+            if position >= trade_size:
+                capital += trade_size * actual_price
+                position -= trade_size
+                sell_signals.append(i)  # 记录卖出的索引
+                print(f"  Sell {trade_size} shares at price {actual_price:.2f}. New capital = {capital:.2f}, Position = {position} shares.")
+        else:
+            # 没有触发交易
+            print("  No trade.")
+        
+        # 更新总资产（现金 + 持有股票的价值）
+        total_capital = capital + position * actual_price
+        capital_curve.append(total_capital)
+        cash_history.append(capital)
+        positions_history.append(position)
+    
+    # 创建回测结果 DataFrame
+    results_df = pd.DataFrame({
+        'Capital': capital_curve,
+        'Cash': cash_history,
+        'Position': positions_history,
+        'Actual_Price': y_test,
+        'Predicted_Price': y_pred
+    })
+    
+    # 计算回测指标
+    total_return = (capital_curve[-1] - initial_cash) / initial_cash * 100
+    max_drawdown = calculate_max_drawdown(np.array(capital_curve))
+    sharpe_ratio = calculate_sharpe_ratio(pd.Series(capital_curve).pct_change().dropna())
+    
+    backtest_metrics = {
+        'Total Return (%)': total_return,
+        'Max Drawdown (%)': max_drawdown,
+        'Sharpe Ratio': sharpe_ratio
+    }
+    
+    return results_df, backtest_metrics, buy_signals, sell_signals
+
+# 5. 计算最大回撤
+def calculate_max_drawdown(capital_curve):
+    """
+    计算最大回撤
+    :param capital_curve: 资本曲线 (list or array)
+    :return: 最大回撤值 (%)
+    """
+    running_max = np.maximum.accumulate(capital_curve)
+    drawdown = (running_max - capital_curve) / running_max
+    max_drawdown = np.max(drawdown) * 100
+    return max_drawdown
+
+# 6. 计算夏普比率
+def calculate_sharpe_ratio(returns, risk_free_rate=0.01):
+    """
+    计算夏普比率
+    :param returns: 每日收益率 (Series)
+    :param risk_free率
+    :return: 夏普比率
+    """
+    excess_returns = returns - (risk_free_rate / 252)
+    avg_excess_return = np.mean(excess_returns)
+    std_excess_return = np.std(excess_returns)
+    sharpe_ratio = avg_excess_return / std_excess_return * np.sqrt(252)  # 年化
+    return sharpe_ratio
+
+# 7. 绘制资本曲线和买卖信号
+def plot_price_with_signals(results_df, buy_signals, sell_signals, symbol):
+    """
+    绘制价格和买卖信号
+    :param results_df: 回测结果 DataFrame
+    :param buy_signals: 买入信号索引
+    :param sell_signals: 卖出信号索引
+    :param symbol: 股票代码
+    """
+    plt.figure(figsize=(12, 6))
+    plt.plot(results_df.index, results_df['Actual_Price'], label='Actual Price', color='blue')
+    
+    # 绘制买入信号 (绿色向上箭头)
+    plt.plot(results_df.index[buy_signals], results_df['Actual_Price'].iloc[buy_signals], '^', markersize=10, color='g', lw=0, label='Buy Signal')
+    
+    # 绘制卖出信号 (红色向下箭头)
+    plt.plot(results_df.index[sell_signals], results_df['Actual_Price'].iloc[sell_signals], 'v', markersize=10, color='r', lw=0, label='Sell Signal')
+
+    plt.title(f"{symbol} Price and Buy/Sell Signals")
+    plt.xlabel('日期')
+    plt.ylabel('价格')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    # 假设我们从数据库或 CSV 中读取的股价数据 DataFrame
+    df_price = fetch_data_from_db('stock_price_tw')  # 或从其他地方读取数据
+    
+    if df_price is not None:
+        # 只取前五只股票
+        top_5_symbols = df_price['symbol'].unique()[:5]
+        df_price = df_price[df_price['symbol'].isin(top_5_symbols)]
+        
+        # 存储所有股票的评估指标
+        all_metrics = []
+        
+        # 对每只股票进行回测
+        for symbol in top_5_symbols:
+            stock_data = df_price[df_price['symbol'] == symbol]
+            print(f"\n正在处理股票: {symbol}")
+            
+            # 准备数据，使用较长的时间窗口
+            X, y = prepare_ml_data_for_forecast(stock_data, lag_days=20)
+            
+            # 检查数据是否足够
+            if len(X) == 0:
+                print(f"股票 {symbol} 的数据不足，无法进行预测。")
+                continue
+            
+            # 训练模型并获取预测结果
+            model, scaler, metrics, y_test, y_pred = train_random_forest_for_forecast(X, y)
+            
+            # 将股票代码加入到评估指标字典中
+            metrics['Symbol'] = symbol
+            all_metrics.append(metrics)
+            
+            # 进行交易策略回测，并获取买卖信号，设置 1% 的交易阈值
+            results_df, backtest_metrics, buy_signals, sell_signals = backtest_strategy(y_test, y_pred, threshold=0.01)
+            plot_price_with_signals(results_df, buy_signals, sell_signals, symbol)
+            
+            # 打印回测指标
+            print(f"回测指标（股票 {symbol}）:")
+            for key, value in backtest_metrics.items():
+                print(f"{key}: {value:.2f}")
+        
+        # 将所有股票的评估指标转换为 DataFrame
+        metrics_df = pd.DataFrame(all_metrics)
+        print("\n模型评估指标:")
+        print(metrics_df)

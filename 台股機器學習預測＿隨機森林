@@ -1,0 +1,190 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
+
+# 1. 创建滞后特征的函数
+def create_lagged_features(df, lag_days=5):
+    lagged_data = pd.DataFrame()
+
+    # 创建滞后特征
+    for i in range(1, lag_days + 1):
+        lagged_data[f'lag_{i}'] = df['close_price'].shift(i)
+    
+    # 目标值是未来一天的收盘价
+    lagged_data['target'] = df['close_price'].shift(-1)
+
+    # 移除空值
+    lagged_data.dropna(inplace=True)
+    
+    return lagged_data
+
+# 2. 准备数据
+def prepare_ml_data_for_forecast(df_price, lag_days=5):
+    # 设置日期为索引
+    df_price['date'] = pd.to_datetime(df_price['date'])
+    df_price.set_index('date', inplace=True)
+
+    # 创建滞后特征
+    lagged_data = create_lagged_features(df_price, lag_days=lag_days)
+    
+    # 设置特征和目标变量
+    features = [f'lag_{i}' for i in range(1, lag_days + 1)]
+    X = lagged_data[features]
+    y = lagged_data['target']
+    
+    return X, y
+
+# 3. 构建随机森林模型并进行训练和预测
+def train_random_forest_for_forecast(X, y):
+    # 分割数据集为训练集和测试集
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # 标准化数据
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # 构建随机森林回归模型
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+
+    # 预测
+    y_pred = rf.predict(X_test)
+
+    # 计算评估指标
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    # 计算 MAPE
+    def mean_absolute_percentage_error(y_true, y_pred): 
+        return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    
+    mape = mean_absolute_percentage_error(y_test, y_pred)
+
+    # 计算 SMAPE
+    def smape(y_true, y_pred):
+        return 100 * np.mean(2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred)))
+
+    smape_value = smape(y_test, y_pred)
+
+    # 创建评估结果的字典
+    metrics = {
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAE': mae,
+        'R²': r2,
+        'MAPE (%)': mape,
+        'SMAPE (%)': smape_value
+    }
+
+    return rf, scaler, metrics
+
+# 4. 预测未来几期的股价
+def predict_future_stock_prices(model, scaler, last_data, periods=5):
+    predictions = []
+    current_data = last_data.copy()
+
+    for _ in range(periods):
+        # 标准化数据
+        current_data_scaled = scaler.transform([current_data])
+
+        # 使用模型预测下一天的股价
+        predicted_price = model.predict(current_data_scaled)
+        predictions.append(predicted_price[0])
+
+        # 更新 current_data，将预测值作为新的一天的滞后特征
+        current_data = np.roll(current_data, 1)  # 移动滞后特征
+        current_data[0] = predicted_price  # 将预测值作为最近一天的价格
+
+    return predictions
+
+# 5. 绘制股票价格走势和预测结果
+def plot_stock_prices(stock_data, future_predictions):
+    """
+    绘制股票的历史收盘价和预测的未来股价
+    :param stock_data: 包含历史股价数据的 DataFrame
+    :param future_predictions: 预测的未来股价列表
+    """
+    # 提取历史收盘价
+    historical_prices = stock_data['close_price'].copy()
+    historical_dates = stock_data.index
+
+    # 仅保留最近25期的数据
+    historical_prices = historical_prices[-25:]
+
+    # 创建未来日期索引，从最后一个日期的下一天开始
+    last_date = historical_dates[-1]
+    next_date = last_date + pd.Timedelta(days=1)
+    future_dates = pd.date_range(start=next_date, periods=len(future_predictions), freq='B')
+
+    # 创建预测的价格 Series
+    future_prices = pd.Series(future_predictions, index=future_dates)
+
+    # 合并历史价格和预测价格
+    all_prices = pd.concat([historical_prices, future_prices])
+
+    # 绘图
+    plt.figure(figsize=(12, 6))
+    plt.plot(all_prices.index, all_prices.values, label='Historical and Predicted Close Prices')
+    plt.axvline(x=historical_prices.index[-1], color='r', linestyle='--', label='Prediction Start')
+    plt.title(f"Stock {stock_data['symbol'].iloc[0]} Price and Prediction")
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    # 假设我们从数据库或csv中读取的股价数据 DataFrame
+    df_price = fetch_data_from_db('stock_price_tw')  # 或从其他地方读取数据
+
+    if df_price is not None:
+        # 只取前五只股票
+        top_5_symbols = df_price['symbol'].unique()[:5]
+        df_price = df_price[df_price['symbol'].isin(top_5_symbols)]
+
+        # 创建一个列表来存储所有股票的评估指标
+        all_metrics = []
+
+        # 对每只股票进行单独的预测
+        for symbol in top_5_symbols:
+            stock_data = df_price[df_price['symbol'] == symbol]
+            print(f"\n正在处理股票: {symbol}")
+
+            # 准备数据，使用滚动窗口的方式创建特征
+            X, y = prepare_ml_data_for_forecast(stock_data, lag_days=5)
+
+            # 检查数据是否足够
+            if len(X) == 0:
+                print(f"股票 {symbol} 的数据不足，无法进行预测。")
+                continue
+
+            # 训练随机森林模型并进行股价预测
+            model, scaler, metrics = train_random_forest_for_forecast(X, y)
+
+            # 将股票代码加入到评估指标字典中
+            metrics['Symbol'] = symbol
+            all_metrics.append(metrics)
+
+            # 提取最后的5天数据，作为未来股价预测的基础
+            last_data = X.iloc[-1].values  # 最后一笔滞后特征数据
+
+            # 预测未来5期的股价
+            future_predictions = predict_future_stock_prices(model, scaler, last_data, periods=5)
+            print(f"股票 {symbol} 未来5期的预测股价: {future_predictions}")
+
+            # 绘制股价走势和预测图
+            plot_stock_prices(stock_data, future_predictions)
+
+        # 将所有股票的评估指标转换为一个 DataFrame
+        metrics_df = pd.DataFrame(all_metrics)
+
+        # 打印完整的评估指标 DataFrame
+        print("\n所有股票的评估指标:")
+        print(metrics_df)
